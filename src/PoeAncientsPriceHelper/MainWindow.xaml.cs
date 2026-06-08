@@ -16,7 +16,9 @@ public partial class MainWindow : MetroWindow
     private bool _loading;
 
     private const int HotkeyId = 1;
+    private const int StartStopHotkeyId = 2;
     private const int VK_F4 = 0x73;
+    private const int VK_F5 = 0x74;
     private IntPtr _hwnd;
 
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -30,6 +32,7 @@ public partial class MainWindow : MetroWindow
         {
             _hwnd = new WindowInteropHelper(this).Handle;
             RegisterHotKey(_hwnd, HotkeyId, 0, VK_F4);
+            RegisterHotKey(_hwnd, StartStopHotkeyId, 0, VK_F5);
             HwndSource.FromHwnd(_hwnd)!.AddHook(WndProc);
         };
     }
@@ -37,10 +40,11 @@ public partial class MainWindow : MetroWindow
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
         const int WM_HOTKEY = 0x0312;
-        if (msg == WM_HOTKEY && wParam.ToInt32() == HotkeyId)
+        if (msg == WM_HOTKEY)
         {
-            RunCalibration();
-            handled = true;
+            int id = wParam.ToInt32();
+            if (id == HotkeyId) { RunCalibration(); handled = true; }
+            else if (id == StartStopHotkeyId) { ToggleStartStop(); handled = true; }
         }
         return IntPtr.Zero;
     }
@@ -132,11 +136,16 @@ public partial class MainWindow : MetroWindow
 
     private void CalibrateButton_Click(object sender, RoutedEventArgs e) => RunCalibration();
 
-    private void StartStopButton_Click(object sender, RoutedEventArgs e)
+    private void StartStopButton_Click(object sender, RoutedEventArgs e) => ToggleStartStop();
+
+    // Shared by the Start/Stop button and the F5 global hotkey.
+    private void ToggleStartStop()
     {
         if (_engine is null)
         {
-            _engine = new ScanEngine(_config, _repo!, _icons!);
+            // F5 can fire even when the button is disabled — don't start until we're ready.
+            if (!_config.IsCalibrated || _repo is null || _icons is null) return;
+            _engine = new ScanEngine(_config, _repo, _icons);
             _engine.Start();
             StartStopButton.Content = "Stop";
             StartStopButton.Background = System.Windows.Media.Brushes.DarkRed;
@@ -154,6 +163,7 @@ public partial class MainWindow : MetroWindow
     private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
     {
         UnregisterHotKey(_hwnd, HotkeyId);
+        UnregisterHotKey(_hwnd, StartStopHotkeyId);
         _engine?.StopAndWait(TimeSpan.FromSeconds(2));
         _engine?.Dispose();
         _repo?.Dispose();

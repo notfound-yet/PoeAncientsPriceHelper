@@ -201,13 +201,17 @@ internal sealed class PriceOverlayForm : Form
         decimal unit = useDivine ? row.DivineValue : row.ExaltedValue;
         decimal total = unit * mult;
         string fmt = useDivine ? "0.00" : "0.#";
+        // Always format prices with a '.' decimal separator regardless of the machine's locale —
+        // PoE prices are universally written with a dot, and it avoids "0,1"-style confusion on
+        // comma-decimal locales (e.g. pt-BR).
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
 
         DrawIcon(g, useDivine ? _icons.Divine : _icons.Exalted, useDivine ? "d" : "ex", x, iconY);
 
         // Multiple items: show total, then per-each price in parentheses.
         string label = mult > 1
-            ? $"{total.ToString(fmt)} ({unit.ToString(fmt)} each)"
-            : total.ToString(fmt);
+            ? $"{total.ToString(fmt, inv)} ({unit.ToString(fmt, inv)} each)"
+            : total.ToString(fmt, inv);
         // Most valuable row → bright green; otherwise gold (divine) / white (exalted).
         var color = highlightTop ? Color.FromArgb(80, 255, 120) : (useDivine ? Color.Gold : Color.White);
         using var brush = new SolidBrush(color);

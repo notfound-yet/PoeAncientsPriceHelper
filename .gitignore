@@ -22,6 +22,8 @@ Screenshot_*.png
 list_1.png
 sample.png
 sample 1.png
+*.jpg
+*.jpeg
 
 # Currency icons fetched from the CDN at first run
 divine.png
