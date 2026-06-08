@@ -16,7 +16,16 @@ public class ConfigStoreTests
         Assert.Equal("Runes of Aldur", cfg.LeagueName);
         Assert.Equal(8, cfg.OverlayXOffset);
         Assert.Equal("custom_prices.json", cfg.CustomPricesPath);
+        Assert.Equal("VcF5", cfg.StartStopHotkey);
         Assert.False(cfg.IsCalibrated);
+    }
+
+    [Fact]
+    public void StartStopHotkey_RoundTrips()
+    {
+        using var dir = new TempDir();
+        SaveTo(dir.Path, new AppConfig { StartStopHotkey = "VcF7" });
+        Assert.Equal("VcF7", LoadFrom(dir.Path).StartStopHotkey);
     }
 
     [Fact]

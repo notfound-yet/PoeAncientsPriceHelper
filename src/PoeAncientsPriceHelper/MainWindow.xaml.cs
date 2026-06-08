@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using MahApps.Metro.Controls;
+using SharpHook.Data;
 
 namespace PoeAncientsPriceHelper;
 
@@ -15,10 +16,10 @@ public partial class MainWindow : MetroWindow
     private readonly HttpClient _http = new();
     private bool _loading;
 
+    // F4 (calibrate) stays a Win32 hotkey — it's a rare, full-screen action that benefits from being
+    // suppressed from the game. Start/Stop moved to the App-level SharpHook hook (configurable key).
     private const int HotkeyId = 1;
-    private const int StartStopHotkeyId = 2;
     private const int VK_F4 = 0x73;
-    private const int VK_F5 = 0x74;
     private IntPtr _hwnd;
 
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -34,15 +35,11 @@ public partial class MainWindow : MetroWindow
         {
             _hwnd = new WindowInteropHelper(this).Handle;
             // RegisterHotKey is system-wide and fails (returns false) if another window already owns
-            // the key — e.g. a not-yet-fully-exited previous instance. Capture the result so a failed
-            // F5/F4 isn't a silent mystery; surface it in the window title.
-            bool f4 = RegisterHotKey(_hwnd, HotkeyId, 0, VK_F4);
-            bool f5 = RegisterHotKey(_hwnd, StartStopHotkeyId, 0, VK_F5);
-            if (!f4 || !f5)
+            // the key. Surface a failed F4 in the title rather than letting it fail silently.
+            if (!RegisterHotKey(_hwnd, HotkeyId, 0, VK_F4))
             {
-                var failed = string.Join("+", new[] { f4 ? null : "F4", f5 ? null : "F5" }.Where(s => s is not null));
-                Console.Error.WriteLine($"[Hotkey] RegisterHotKey failed for {failed} (already held by another app/instance)");
-                Title += $"  ⚠ {failed} hotkey unavailable";
+                Console.Error.WriteLine("[Hotkey] RegisterHotKey failed for F4 (already held by another app/instance)");
+                Title += "  ⚠ F4 hotkey unavailable";
             }
             HwndSource.FromHwnd(_hwnd)!.AddHook(WndProc);
         };
@@ -51,12 +48,7 @@ public partial class MainWindow : MetroWindow
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
         const int WM_HOTKEY = 0x0312;
-        if (msg == WM_HOTKEY)
-        {
-            int id = wParam.ToInt32();
-            if (id == HotkeyId) { RunCalibration(); handled = true; }
-            else if (id == StartStopHotkeyId) { ToggleStartStop(); handled = true; }
-        }
+        if (msg == WM_HOTKEY && wParam.ToInt32() == HotkeyId) { RunCalibration(); handled = true; }
         return IntPtr.Zero;
     }
 
@@ -74,6 +66,9 @@ public partial class MainWindow : MetroWindow
         LeagueBox.SelectedItem = _config.AvailableLeagues.Contains(_config.LeagueName)
             ? _config.LeagueName
             : _config.AvailableLeagues.FirstOrDefault();
+        var key = HotkeyBinding.Parse(_config.StartStopHotkey);
+        HotkeyLabel.Text = HotkeyBinding.Display(key);
+        App.SetStartStopKey(key);   // arm the global hook with the persisted binding
         UpdateRegionLabel();
         _loading = false;
     }
@@ -149,12 +144,13 @@ public partial class MainWindow : MetroWindow
 
     private void StartStopButton_Click(object sender, RoutedEventArgs e) => ToggleStartStop();
 
-    // Shared by the Start/Stop button and the F5 global hotkey.
-    private void ToggleStartStop()
+    // Shared by the Start/Stop button and the configurable global hotkey (invoked via App, marshalled
+    // to the UI thread). internal so the App-level hook can reach it.
+    internal void ToggleStartStop()
     {
         if (_engine is null)
         {
-            // F5 can fire even when the button is disabled — don't start until we're ready.
+            // The hotkey can fire even when the button is disabled — don't start until we're ready.
             if (!_config.IsCalibrated || _repo is null || _icons is null) return;
             _engine = new ScanEngine(_config, _repo, _icons);
             _engine.Start();
@@ -174,7 +170,6 @@ public partial class MainWindow : MetroWindow
     private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
     {
         UnregisterHotKey(_hwnd, HotkeyId);
-        UnregisterHotKey(_hwnd, StartStopHotkeyId);
         _engine?.StopAndWait(TimeSpan.FromSeconds(2));
         _engine?.Dispose();
         _repo?.Dispose();
@@ -189,5 +184,40 @@ public partial class MainWindow : MetroWindow
         _config.LeagueName = league;
         ConfigStore.Save(_config);
         await StartupAsync();   // re-fetch prices for the newly selected league
+    }
+
+    private void RebindButton_Click(object sender, RoutedEventArgs e)
+    {
+        RebindButton.IsEnabled = false;
+        RebindButton.Content = "Press a key… (Esc to cancel)";
+        App.BeginHotkeyCapture(OnHotkeyCaptured);   // outcome arrives on the UI thread
+    }
+
+    // Invoked (marshalled to the UI thread) when the global hook resolves a rebind capture.
+    private void OnHotkeyCaptured(App.CaptureOutcome outcome, KeyCode code)
+    {
+        switch (outcome)
+        {
+            case App.CaptureOutcome.Captured:
+                _config.StartStopHotkey = HotkeyBinding.ToStorage(code);
+                ConfigStore.Save(_config);
+                App.SetStartStopKey(code);
+                HotkeyLabel.Text = HotkeyBinding.Display(code);
+                EndRebind();
+                break;
+            case App.CaptureOutcome.Reserved:
+                // Still listening — tell the user why that key won't take, keep the prompt up.
+                RebindButton.Content = $"{HotkeyBinding.Display(code)} is in use — try another";
+                break;
+            case App.CaptureOutcome.Cancelled:
+                EndRebind();
+                break;
+        }
+    }
+
+    private void EndRebind()
+    {
+        RebindButton.Content = "Rebind";
+        RebindButton.IsEnabled = true;
     }
 }

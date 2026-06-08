@@ -18,6 +18,9 @@ internal sealed class AppConfig
     public int RegionWidth { get; set; } = 0;
     public int RegionHeight { get; set; } = 0;
     public int OverlayXOffset { get; set; } = 8;
+    // Start/Stop global hotkey, stored as a SharpHook KeyCode name (e.g. "VcF5"). Missing in older
+    // configs → defaults to F5, preserving prior behaviour. See HotkeyBinding for parse/display.
+    public string StartStopHotkey { get; set; } = "VcF5";
     public string ReferencePixelColor { get; set; } = "#000000"; // kept for JSON backwards compat, unused
     public string CustomPricesPath { get; set; } = "custom_prices.json";
 

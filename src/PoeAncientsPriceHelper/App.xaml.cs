@@ -13,6 +13,24 @@ public partial class App : System.Windows.Application
     private TaskPoolGlobalHook? _hook;
     private bool _leftCtrlDown;
 
+    // The currently-bound Start/Stop key, matched on every key event. MainWindow pushes the persisted
+    // value once config is loaded and again on each rebind; until then F5 keeps working as before.
+    private static volatile KeyCode _startStopKey = HotkeyBinding.Default;
+    internal static void SetStartStopKey(KeyCode key) => _startStopKey = key;
+
+    // One-shot rebind capture. While active, the hook swallows keys from their normal actions and the
+    // next non-reserved key becomes the binding. Outcomes are reported via the callback, marshalled to
+    // the UI thread. Reserved keys report back but keep listening; Esc cancels.
+    internal enum CaptureOutcome { Captured, Cancelled, Reserved }
+    private static volatile bool _capturing;
+    private static Action<CaptureOutcome, KeyCode>? _captureCallback;
+
+    internal static void BeginHotkeyCapture(Action<CaptureOutcome, KeyCode> onEvent)
+    {
+        _captureCallback = onEvent;
+        _capturing = true;
+    }
+
     // Single-instance guard. Held for the lifetime of the process; a second launch fails to
     // create it, focuses the already-running window, and exits. Without this, every extra launch
     // is a full second app that also receives the global F3 hook and paints its own overlay —
@@ -68,22 +86,57 @@ public partial class App : System.Windows.Application
         _hook = new TaskPoolGlobalHook();
         _hook.KeyPressed += (_, ev) =>
         {
+            if (_capturing) return;   // rebind in progress: swallow keys from their normal actions
             // ESC closes the in-game panel — hide the overlay the instant the key goes down.
             if (ev.Data.KeyCode == KeyCode.VcEscape) DismissOverlay();
             else if (ev.Data.KeyCode is KeyCode.VcLeftControl) _leftCtrlDown = true;
         };
         _hook.KeyReleased += (_, ev) =>
         {
-            if (ev.Data.KeyCode == KeyCode.VcF3) PriceOverlayManager.ToggleDebug();
-            else if (ev.Data.KeyCode is KeyCode.VcLeftControl) _leftCtrlDown = false;
+            var code = ev.Data.KeyCode;
+            if (_capturing) { HandleCapture(code); return; }   // swallow + consume for rebind
+            // Toggle on release (not press) so holding the key can't auto-repeat-fire many toggles.
+            if (code == KeyCode.VcF3) PriceOverlayManager.ToggleDebug();
+            else if (code == _startStopKey) InvokeStartStopToggle();
+            else if (code is KeyCode.VcLeftControl) _leftCtrlDown = false;
         };
         // Left-Ctrl + left click (the in-game "purchase" gesture) also dismisses the overlay.
         _hook.MousePressed += (_, ev) =>
         {
+            if (_capturing) return;
             if (ev.Data.Button == MouseButton.Button1 && _leftCtrlDown) DismissOverlay();
         };
         _ = _hook.RunAsync();
     }
+
+    // Runs on a hook thread-pool thread. Esc cancels; a reserved key reports back but keeps listening;
+    // anything else is the new binding. The callback is marshalled to the UI thread.
+    private static void HandleCapture(KeyCode code)
+    {
+        if (code == KeyCode.VcEscape) { FinishCapture(CaptureOutcome.Cancelled, code); return; }
+        if (HotkeyBinding.IsReserved(code)) { ReportCapture(CaptureOutcome.Reserved, code); return; }
+        FinishCapture(CaptureOutcome.Captured, code);
+    }
+
+    private static void FinishCapture(CaptureOutcome outcome, KeyCode code)
+    {
+        _capturing = false;
+        var cb = _captureCallback;
+        _captureCallback = null;
+        ReportTo(cb, outcome, code);
+    }
+
+    private static void ReportCapture(CaptureOutcome outcome, KeyCode code) =>
+        ReportTo(_captureCallback, outcome, code);
+
+    private static void ReportTo(Action<CaptureOutcome, KeyCode>? cb, CaptureOutcome outcome, KeyCode code)
+    {
+        if (cb is null) return;
+        Current?.Dispatcher.BeginInvoke(() => cb(outcome, code));
+    }
+
+    private static void InvokeStartStopToggle() =>
+        Current?.Dispatcher.BeginInvoke(() => (Current.MainWindow as MainWindow)?.ToggleStartStop());
 
     protected override void OnExit(ExitEventArgs e)
     {
