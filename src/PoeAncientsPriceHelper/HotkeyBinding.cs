@@ -9,16 +9,16 @@ namespace PoeAncientsPriceHelper;
 // hook reports — so there is no WPF-Key ↔ KeyCode mapping to maintain.
 internal static class HotkeyBinding
 {
-    public const KeyCode Default = KeyCode.VcF5;
+    public const KeyCode Default = KeyCode.VcF6;
 
     // The three rebindable actions. Used to tell capture which binding it's replacing so it can reject
     // a key already taken by one of the *other two* (a collision check that lives in App, where the
     // current bindings are held).
     public enum Action { StartStop, Debug, Calibrate }
 
-    public const KeyCode DefaultStartStop = KeyCode.VcF5;
+    public const KeyCode DefaultStartStop = KeyCode.VcF6;
     public const KeyCode DefaultDebug = KeyCode.VcF3;
-    public const KeyCode DefaultCalibrate = KeyCode.VcF4;
+    public const KeyCode DefaultCalibrate = KeyCode.VcF5;
 
     // Keys hard-wired to fixed gestures that mirror in-game actions (Esc closes the panel, L/R-Ctrl is
     // the buy modifier). These can never be bound to a rebindable action — a single press would fire

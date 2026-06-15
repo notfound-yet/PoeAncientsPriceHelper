@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mah="http://metro.mahapps.com/winfx/xaml/controls"
-        Title="Poe Ancients Price Helper" Height="410" Width="500"
+        Title="Poe Ancients Price Helper" Height="480" Width="500"
         Icon="app.ico"
         ResizeMode="CanMinimize"
         WindowStartupLocation="CenterScreen"
@@ -30,6 +30,9 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
         <Grid.ColumnDefinitions>
@@ -45,7 +48,7 @@
 
         <TextBlock Grid.Row="2" Grid.Column="0" Text="Start/Stop key:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center"/>
         <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
-            <TextBlock x:Name="HotkeyLabel" Text="F5" VerticalAlignment="Center"
+            <TextBlock x:Name="HotkeyLabel" Text="F6" VerticalAlignment="Center"
                        FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" MinWidth="46"/>
             <Button x:Name="RebindButton" Content="Rebind" Padding="10,2" FontSize="11"
                     Click="RebindButton_Click"/>
@@ -61,7 +64,7 @@
 
         <TextBlock Grid.Row="4" Grid.Column="0" Text="Calibrate key:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center"/>
         <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
-            <TextBlock x:Name="CalibrateHotkeyLabel" Text="F4" VerticalAlignment="Center"
+            <TextBlock x:Name="CalibrateHotkeyLabel" Text="F5" VerticalAlignment="Center"
                        FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" MinWidth="46"/>
             <Button x:Name="RebindCalibrateButton" Content="Rebind" Padding="10,2" FontSize="11"
                     Click="RebindCalibrateButton_Click"/>
@@ -77,26 +80,39 @@
                    Text="Idle — prices not loaded"
                    Foreground="#666" FontSize="11" Margin="0,10,0,0"/>
 
-        <Button Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="2"
+        <StackPanel Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,6,0,0">
+            <Button x:Name="RefreshPricesButton" Content="Atualizar preços"
+                    Padding="10,4" FontSize="11" Click="RefreshPricesButton_Click"/>
+            <CheckBox x:Name="AutoRefreshCheckBox" Content="Auto-refresh (30 min)"
+                      Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11"
+                      IsChecked="True" Checked="AutoRefreshCheckBox_Changed" Unchecked="AutoRefreshCheckBox_Changed"/>
+        </StackPanel>
+
+        <TextBlock Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2"
+                   x:Name="StaleCacheWarning"
+                   Text=""
+                   Foreground="#E0A040" FontSize="11" Margin="0,4,0,0" Visibility="Collapsed"/>
+
+        <Button Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="2"
                 x:Name="StartStopButton"
                 Content="Start" IsEnabled="False"
                 Margin="0,10,0,0"
                 Background="#1A3A1A" Foreground="#66FF66" BorderBrush="#337733"
                 Click="StartStopButton_Click"/>
 
-        <TextBlock Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2"
+        <TextBlock Grid.Row="10" Grid.Column="0" Grid.ColumnSpan="2"
                    x:Name="VersionLabel"
                    HorizontalAlignment="Left" VerticalAlignment="Bottom"
                    Foreground="#666" FontSize="11"/>
 
-        <TextBlock Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2"
+        <TextBlock Grid.Row="10" Grid.Column="0" Grid.ColumnSpan="2"
                    x:Name="UpdateLink"
                    HorizontalAlignment="Center" VerticalAlignment="Bottom"
                    Foreground="#FF5555" FontSize="11" FontWeight="SemiBold"
                    Cursor="Hand" Visibility="Collapsed" TextDecorations="Underline"
                    MouseLeftButtonUp="UpdateLink_Click"/>
 
-        <Button Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2"
+        <Button Grid.Row="10" Grid.Column="0" Grid.ColumnSpan="2"
                 x:Name="DonateButton"
                 Content="☕ Buy me a coffee"
                 HorizontalAlignment="Right" VerticalAlignment="Bottom"

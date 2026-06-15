@@ -15,7 +15,7 @@ public class ConfigStoreTests
         Assert.Equal("Runes of Aldur", cfg.LeagueName);
         Assert.Equal(8, cfg.OverlayXOffset);
         Assert.Equal("custom_prices.json", cfg.CustomPricesPath);
-        Assert.Equal("VcF5", cfg.StartStopHotkey);
+        Assert.Equal("VcF6", cfg.StartStopHotkey);
         Assert.False(cfg.IsCalibrated);
     }
 

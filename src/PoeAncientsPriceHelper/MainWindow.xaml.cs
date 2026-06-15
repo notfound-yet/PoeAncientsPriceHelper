@@ -114,6 +114,7 @@ public partial class MainWindow : MetroWindow
         App.SetDebugKey(debug);
         App.SetCalibrateKey(calibrate);
         UpdateRegionLabel();
+        AutoRefreshCheckBox.IsChecked = _config.AutoRefreshPrices;
         _loading = false;
     }
 
@@ -126,36 +127,110 @@ public partial class MainWindow : MetroWindow
 
     private async Task StartupAsync()
     {
-        StatusLabel.Text = "Fetching prices from poe.ninja…";
+        RefreshPricesButton.IsEnabled = false;
         StartStopButton.IsEnabled = false;
 
         _repo?.Dispose();
         _icons?.Dispose();
 
         _repo = new PriceRepository(_http);
-        _repo.PricesUpdated += OnPricesUpdated;   // keep the "last fetch" label live on each refresh
+        _repo.PricesUpdated += OnPricesUpdated;
         _icons = new IconCache(_http);
 
-        await Task.WhenAll(
-            _repo.InitialFetchAsync(_config),
-            _icons.LoadAsync());
+        bool cached = _repo.TryLoadFromCache(_config);
+        if (cached)
+        {
+            UpdateStatusLabel();
+            StartStopButton.IsEnabled = _config.IsCalibrated;
+            StatusLabel.Text += "  ·  atualizando em segundo plano…";
+        }
+        else
+        {
+            StatusLabel.Text = "Buscando preços no poe.ninja…";
+        }
 
-        _repo.StartAutoRefresh(_config);
+        await _icons.LoadAsync();
 
-        UpdateStatusLabel();
-        StartStopButton.IsEnabled = _config.IsCalibrated;
+        if (cached)
+            _ = RefreshPricesInBackgroundAsync();
+        else
+        {
+            await _repo.RefreshAsync(_config);
+            UpdateStatusLabel();
+            StartStopButton.IsEnabled = _config.IsCalibrated;
+        }
+
+        _repo.ConfigureAutoRefresh(_config);
+        RefreshPricesButton.IsEnabled = true;
+    }
+
+    private async Task RefreshPricesInBackgroundAsync()
+    {
+        if (_repo is null) return;
+        try
+        {
+            await _repo.RefreshAsync(_config);
+        }
+        finally
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                UpdateStatusLabel();
+                StartStopButton.IsEnabled = _config.IsCalibrated;
+            });
+        }
+    }
+
+    private async void RefreshPricesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_repo is null || _repo.IsFetching) return;
+        RefreshPricesButton.IsEnabled = false;
+        StatusLabel.Text = "Buscando preços no poe.ninja…";
+        try
+        {
+            await _repo.RefreshAsync(_config);
+            UpdateStatusLabel();
+        }
+        finally
+        {
+            RefreshPricesButton.IsEnabled = !_repo.IsFetching;
+        }
+    }
+
+    private void AutoRefreshCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_loading || _repo is null) return;
+        _config.AutoRefreshPrices = AutoRefreshCheckBox.IsChecked == true;
+        ConfigStore.Save(_config);
+        _repo.ConfigureAutoRefresh(_config);
     }
 
     // The 30-min background refresh fires on a thread-pool thread — marshal to the UI thread
     // before touching the label. (Previously the label was set once at startup and never updated,
     // so it stayed frozen at the launch-time fetch even though prices kept refreshing.)
-    private void OnPricesUpdated() => Dispatcher.BeginInvoke(UpdateStatusLabel);
+    private void OnPricesUpdated() => Dispatcher.BeginInvoke(() =>
+    {
+        UpdateStatusLabel();
+        if (!_repo!.IsFetching) RefreshPricesButton.IsEnabled = true;
+    });
 
     private void UpdateStatusLabel()
     {
         if (_repo is null) return;
-        string fetched = _repo.LastFetchedAt is { } t ? t.ToString("MMM d HH:mm") : "never";
-        StatusLabel.Text = $"{_repo.ItemCount} items loaded  ·  last fetch {fetched}";
+        string fetched = _repo.LastFetchedAt is { } t ? t.ToString("MMM d HH:mm") : "nunca";
+        string source = _repo.IsFromCache && _repo.IsFetching ? "cache" : "poe.ninja";
+        StatusLabel.Text = $"{_repo.ItemCount} itens no catálogo  ·  {_repo.Catalog.Count} nomes  ·  última atualização {fetched} ({source})";
+
+        if (_repo.LastFetchedAt is { } at &&
+            (DateTime.Now - at).TotalHours >= _config.StaleCacheWarningHours)
+        {
+            StaleCacheWarning.Text = $"Preços com mais de {_config.StaleCacheWarningHours}h — considere atualizar.";
+            StaleCacheWarning.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            StaleCacheWarning.Visibility = Visibility.Collapsed;
+        }
     }
 
     private void DonateButton_Click(object sender, RoutedEventArgs e)

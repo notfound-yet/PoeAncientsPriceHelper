@@ -14,43 +14,60 @@ internal sealed class PriceRepository : IDisposable
     private readonly HttpClient _http;
     private volatile IReadOnlyDictionary<string, PriceEntry> _prices =
         new ReadOnlyDictionary<string, PriceEntry>(new Dictionary<string, PriceEntry>());
+    private volatile ExchangeItemCatalog _catalog = ExchangeItemCatalog.Empty;
     private System.Threading.Timer? _timer;
-    // Cancelled on Dispose so a fetch in flight at shutdown (or one stuck behind the HttpClient
-    // timeout) is abandoned cleanly instead of running on against a disposed client.
     private readonly CancellationTokenSource _cts = new();
+    private volatile bool _fetching;
 
     public IReadOnlyDictionary<string, PriceEntry> Prices => _prices;
+    public ExchangeItemCatalog Catalog => _catalog;
     public DateTime? LastFetchedAt { get; private set; }
     public int ItemCount => _prices.Count;
+    public double? LastFetchDurationMs { get; private set; }
+    public bool IsFetching => _fetching;
+    public bool IsFromCache { get; private set; }
 
-    // Raised after every successful fetch (initial + each 30-min background refresh) so the UI can
-    // refresh its "last fetch" label — which otherwise stays frozen at the startup time. Fires on a
-    // thread-pool thread; subscribers must marshal to the UI thread.
     public event Action? PricesUpdated;
 
-    // UncutGems shares the exact same response shape as the others: a root items[] maps each
-    // line id (e.g. "uncut-spirit-gem-19") to a display name that already carries the level
-    // ("Uncut Spirit Gem (Level 19)"), which NormalizeName reduces to "uncut spirit gem level 19" —
-    // the same string the OCR produces. So no special parsing is needed; matching safety (pinning
-    // the gem type + level) lives in ScanEngine.BuildPriceRows.
     private static readonly string[] ExchangeTypes = ["Verisium", "Runes", "Expedition", "Currency", "UncutGems"];
 
     public PriceRepository(HttpClient http) => _http = http;
 
-    public async Task InitialFetchAsync(AppConfig config)
+    public bool TryLoadFromCache(AppConfig config)
+    {
+        var cache = PriceCacheStore.Load(config.LeagueName);
+        if (cache is null) return false;
+
+        var dict = PriceCacheStore.ToDictionary(cache);
+        ApplyCustomOverride(dict, config.CustomPricesPath);
+        PublishPrices(dict, cache.FetchedAt, fromCache: true);
+        return true;
+    }
+
+    public async Task RefreshAsync(AppConfig config)
     {
         await FetchAndMergeAsync(config, _cts.Token);
     }
 
-    public void StartAutoRefresh(AppConfig config)
+    public async Task InitialFetchAsync(AppConfig config) =>
+        await RefreshAsync(config);
+
+    public void ConfigureAutoRefresh(AppConfig config)
     {
         _timer?.Dispose();
-        _timer = new System.Threading.Timer(_ => Task.Run(() => FetchAndMergeAsync(config, _cts.Token)),
-            null, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
+        _timer = null;
+        if (!config.AutoRefreshPrices || config.AutoRefreshIntervalMinutes <= 0) return;
+
+        var interval = TimeSpan.FromMinutes(config.AutoRefreshIntervalMinutes);
+        _timer = new System.Threading.Timer(
+            _ => Task.Run(() => FetchAndMergeAsync(config, _cts.Token)),
+            null, interval, interval);
     }
 
     private async Task FetchAndMergeAsync(AppConfig config, CancellationToken ct)
     {
+        _fetching = true;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             var dict = new Dictionary<string, PriceEntry>();
@@ -61,19 +78,29 @@ internal sealed class PriceRepository : IDisposable
                     dict[name] = entry;
             }
             ApplyCustomOverride(dict, config.CustomPricesPath);
-            _prices = new ReadOnlyDictionary<string, PriceEntry>(dict);
-            LastFetchedAt = DateTime.Now;
+            var fetchedAt = DateTime.Now;
+            PublishPrices(dict, fetchedAt, fromCache: false);
+            LastFetchDurationMs = sw.Elapsed.TotalMilliseconds;
+            PriceCacheStore.Save(config.LeagueName, _prices, fetchedAt);
             PricesUpdated?.Invoke();
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            // Shutting down — abandon this cycle quietly. (A timeout, by contrast, is not
-            // cancellation-requested, so it falls through to the log below.)
-        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[PriceRepository] fetch failed: {ex.Message}");
         }
+        finally
+        {
+            _fetching = false;
+        }
+    }
+
+    private void PublishPrices(Dictionary<string, PriceEntry> dict, DateTime fetchedAt, bool fromCache)
+    {
+        _prices = new ReadOnlyDictionary<string, PriceEntry>(dict);
+        _catalog = new ExchangeItemCatalog(_prices);
+        LastFetchedAt = fetchedAt;
+        IsFromCache = fromCache;
     }
 
     private async Task<Dictionary<string, PriceEntry>> FetchTypeAsync(string league, string type, CancellationToken ct)
@@ -99,14 +126,6 @@ internal sealed class PriceRepository : IDisposable
         return ParseResponse(json);
     }
 
-    // API shape (exchange/current/overview):
-    //   items[]   → { id, name }             — display name lookup
-    //   lines[]   → { id, primaryValue }     — price in the league's PRIMARY currency
-    //   core.primary  → "divine" | "exalted" — which currency primaryValue is denominated in
-    //   core.rates    → { exalted, divine, chaos } — how many of each currency equal 1 primary
-    // The primary currency differs by league: Softcore prices in divines, Hardcore prices in
-    // exalted (divine is too valuable there). So derive both divine- and exalted-denominated
-    // values from primaryValue via the rates, rather than assuming primaryValue is divines.
     private static Dictionary<string, PriceEntry> ParseResponse(string json)
     {
         var result = new Dictionary<string, PriceEntry>();
@@ -114,7 +133,6 @@ internal sealed class PriceRepository : IDisposable
         {
             var obj = JObject.Parse(json);
 
-            // id → display name
             var nameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (obj["items"] is JArray itemsArr)
                 foreach (var item in itemsArr)
@@ -124,8 +142,6 @@ internal sealed class PriceRepository : IDisposable
                     if (id is not null && name is not null) nameMap[id] = name;
                 }
 
-            // rates[x] = how many x equal 1 unit of the primary currency. When the primary IS
-            // divine/exalted, its own rate is implicitly 1 (and absent from the rates object).
             var core = obj["core"];
             var primary = core?["primary"]?.Value<string>() ?? "divine";
             var rates = core?["rates"];
@@ -176,13 +192,7 @@ internal sealed class PriceRepository : IDisposable
         }
     }
 
-    internal static string NormalizeName(string name)
-    {
-        var s = name.ToLowerInvariant();
-        s = Regex.Replace(s, @"[^\w\s]", " ");
-        s = Regex.Replace(s, @"\s+", " ");
-        return s.Trim();
-    }
+    internal static string NormalizeName(string name) => NameNormalizer.Normalize(name);
 
     public void Dispose()
     {

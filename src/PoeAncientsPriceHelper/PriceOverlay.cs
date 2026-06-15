@@ -22,14 +22,17 @@ internal sealed record PriceRow(int CenterY, string OcrText, decimal DivineValue
 internal sealed class PriceOverlayForm : Form
 {
     private IReadOnlyList<PriceRow> _rows = [];
-    private bool _panelOpen;
+    private bool _panelDetected;   // brightness gate: panel region looks open
+    private bool _pricesConfirmed; // OCR matched at least one price (or multi-reward Runeshape panel)
     private bool _reading;  // panel detected, prices not yet resolved → show a "reading…" hint
     private bool _debug;   // F3 toggles the diagnostic boxes/region/"?" text; prices show regardless
+    private ScanTimings? _timings;
     private readonly IconCache _icons;
     private readonly Rectangle _regionRect;
     private readonly int _xOffset;
     private readonly Font _priceFont = new("Consolas", 20, FontStyle.Bold);
     private readonly Font _debugFont = new("Consolas", 18, FontStyle.Regular);
+    private readonly Font _perfFont = new("Consolas", 14, FontStyle.Regular);
     private const int IconSize = 38;
     private const int RowHalfHeight = 25;
 
@@ -60,13 +63,46 @@ internal sealed class PriceOverlayForm : Form
         }
     }
 
-    public void UpdateState(IReadOnlyList<PriceRow> rows, bool panelOpen, bool reading)
+    private bool _captureSuspended;
+
+    public void SuspendForCapture()
     {
         if (IsDisposed) return;
-        if (InvokeRequired) { BeginInvoke(() => UpdateState(rows, panelOpen, reading)); return; }
+        if (InvokeRequired) { Invoke(SuspendForCapture); return; }
+        if (_captureSuspended) return;
+        _captureSuspended = true;
+        if (Visible) Hide();
+    }
+
+    public void ResumeAfterCapture()
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired) { BeginInvoke(ResumeAfterCapture); return; }
+        if (!_captureSuspended) return;
+        _captureSuspended = false;
+        ApplyVisibility();
+        if (Visible) RenderLayered();
+    }
+
+    public void UpdateState(IReadOnlyList<PriceRow> rows, bool panelDetected, bool pricesConfirmed, bool reading, ScanTimings? timings = null)
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired) { BeginInvoke(() => UpdateState(rows, panelDetected, pricesConfirmed, reading, timings)); return; }
         _rows = rows;
-        _panelOpen = panelOpen;
+        _panelDetected = panelDetected;
+        _pricesConfirmed = pricesConfirmed;
         _reading = reading;
+        if (timings is not null) _timings = timings;
+        ApplyVisibility();
+        if (Visible) RenderLayered();
+    }
+
+    // Force debug visuals on (--debug startup). Unlike ToggleDebug, this only enables.
+    public void EnableDebug()
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired) { BeginInvoke(EnableDebug); return; }
+        _debug = true;
         ApplyVisibility();
         if (Visible) RenderLayered();
     }
@@ -83,8 +119,9 @@ internal sealed class PriceOverlayForm : Form
 
     private void ApplyVisibility()
     {
+        if (_captureSuspended) return;
         // Visible when prices are ready, while reading (to show the hint), or in debug mode.
-        bool shouldShow = _panelOpen || _reading || _debug;
+        bool shouldShow = _panelDetected || _reading || _debug;
         if (shouldShow && !Visible) { Show(); ForceTopmost(); }
         // Clear the rows as we hide so a later re-show can't briefly repaint the previous encounter's
         // prices before the scan loop pushes fresh state (#5).
@@ -97,7 +134,8 @@ internal sealed class PriceOverlayForm : Form
     {
         if (IsDisposed) return;
         if (InvokeRequired) { BeginInvoke(HideNow); return; }
-        _panelOpen = false;
+        _panelDetected = false;
+        _pricesConfirmed = false;
         _reading = false;
         _rows = [];   // drop stale prices immediately so debug-mode (still visible) can't repaint them
         ApplyVisibility();
@@ -158,15 +196,21 @@ internal sealed class PriceOverlayForm : Form
         // monitor at (0,0) this is a no-op.
         g.TranslateTransform(-Bounds.Left, -Bounds.Top);
 
+        if (_debug && _timings is not null)
+            PaintPerfHud(g);
+
         // Debug-only: outline of the calibrated region (orange=not detected, green=detected).
         if (_debug)
         {
-            var borderColor = _panelOpen ? Color.LimeGreen : Color.Orange;
+            var borderColor = _pricesConfirmed ? Color.LimeGreen : Color.Orange;
             using var borderPen = new Pen(borderColor, 2);
             g.DrawRectangle(borderPen, _regionRect);
         }
 
-        if (!_panelOpen) return;
+        if (!_panelDetected) return;
+
+        if (_reading && !_pricesConfirmed && !_rows.Any(r => r.HasPrice) && !_debug)
+            PaintReadingHint(g);
 
         int priceX = _regionRect.Right + _xOffset;
 
@@ -222,6 +266,60 @@ internal sealed class PriceOverlayForm : Form
                 bool isTop = pricedCount > 1 && ReferenceEquals(row, topRow);
                 DrawPrice(g, row, priceX, screenY, isTop);
             }
+        }
+    }
+
+    private void PaintReadingHint(Graphics g)
+    {
+        const string text = "Lendo preços…";
+        int x = _regionRect.Right + _xOffset;
+        int y = _regionRect.Top + 8;
+        using var bg = new SolidBrush(Premultiply(Color.FromArgb(170, 20, 20, 28)));
+        var size = g.MeasureString(text, _perfFont);
+        g.FillRectangle(bg, x - 4, y - 2, size.Width + 8, size.Height + 4);
+        using var brush = new SolidBrush(Color.FromArgb(220, 200, 200, 200));
+        g.DrawString(text, _perfFont, brush, x, y);
+    }
+
+    private void PaintPerfHud(Graphics g)
+    {
+        var t = _timings!;
+        string apiLine = t.ApiFetching
+            ? "Preços: buscando API…"
+            : t.LastApiFetchMs is { } apiMs
+                ? $"Preços: cache local (último fetch {apiMs:0} ms)"
+                : "Preços: cache local";
+
+        var lines = new[]
+        {
+            "Perf (último ciclo)",
+            $"Captura:  {t.CaptureMs,6:0.0} ms",
+            $"Detecção: {t.DetectMs,6:0.0} ms",
+            $"OCR:      {t.OcrMs,6:0.0} ms",
+            $"Match:    {t.MatchMs,6:0.0} ms",
+            $"Ciclo:    {t.CycleMs,6:0.0} ms",
+            apiLine,
+        };
+
+        const int pad = 8;
+        float lineH = _perfFont.Height + 2;
+        float maxW = 0;
+        foreach (var line in lines)
+            maxW = Math.Max(maxW, g.MeasureString(line, _perfFont).Width);
+
+        int x = Bounds.Left + 12;
+        int y = Bounds.Bottom - (int)(lineH * lines.Length) - 24;
+        var bgRect = new RectangleF(x - pad, y - pad, maxW + pad * 2, lineH * lines.Length + pad);
+        using var path = RoundedRect(Rectangle.Round(bgRect), 6);
+        using var bg = new SolidBrush(Premultiply(Color.FromArgb(190, 20, 20, 28)));
+        g.FillPath(bg, path);
+
+        using var titleBrush = new SolidBrush(Color.FromArgb(255, 120, 200, 255));
+        using var textBrush = new SolidBrush(Color.FromArgb(230, 220, 220, 220));
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var brush = i == 0 ? titleBrush : textBrush;
+            g.DrawString(lines[i], _perfFont, brush, x, y + i * lineH);
         }
     }
 
@@ -333,7 +431,7 @@ internal sealed class PriceOverlayForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { _priceFont.Dispose(); _debugFont.Dispose(); }
+        if (disposing) { _priceFont.Dispose(); _debugFont.Dispose(); _perfFont.Dispose(); }
         base.Dispose(disposing);
     }
 
@@ -411,10 +509,16 @@ internal static class PriceOverlayManager
         }
     }
 
-    public static void UpdateState(IReadOnlyList<PriceRow> rows, bool panelOpen, bool reading)
+    public static void UpdateState(IReadOnlyList<PriceRow> rows, bool panelDetected, bool pricesConfirmed, bool reading, ScanTimings? timings = null)
     {
         var f = _form;
-        if (f is not null && !f.IsDisposed) f.UpdateState(rows, panelOpen, reading);
+        if (f is not null && !f.IsDisposed) f.UpdateState(rows, panelDetected, pricesConfirmed, reading, timings);
+    }
+
+    public static void EnableDebug()
+    {
+        var f = _form;
+        if (f is not null && !f.IsDisposed) f.EnableDebug();
     }
 
     public static void ForceTopmost()
@@ -433,5 +537,18 @@ internal static class PriceOverlayManager
     {
         var f = _form;
         if (f is not null && !f.IsDisposed) f.HideNow();
+    }
+
+    // Hide the overlay while CopyFromScreen runs so debug text / prices are not re-OCR'd.
+    public static void SuspendForCapture()
+    {
+        var f = _form;
+        if (f is not null && !f.IsDisposed) f.SuspendForCapture();
+    }
+
+    public static void ResumeAfterCapture()
+    {
+        var f = _form;
+        if (f is not null && !f.IsDisposed) f.ResumeAfterCapture();
     }
 }

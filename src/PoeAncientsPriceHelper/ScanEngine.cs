@@ -70,7 +70,9 @@ internal sealed class ScanEngine : IDisposable
             return;
         }
 
-        Log($"START prices={_prices.ItemCount} icons={_icons.IsAvailable} region={_config.RegionRect}");
+        Log($"START prices={_prices.ItemCount} catalog={_prices.Catalog.Count} icons={_icons.IsAvailable} region={_config.RegionRect}");
+        if (_prices.Catalog.Count == 0)
+            Log("WARN catálogo vazio — clique em 'Atualizar preços' ou verifique a liga");
 
         using var scanner = new OcrScanner(tessdataDir, Log, App.DebugMode);
         var detector = new ListDetector();
@@ -105,16 +107,38 @@ internal sealed class ScanEngine : IDisposable
         const int CloseBrightness = 80;
 
         PriceOverlayManager.EnsureVisible(_config.RegionRect, _config.OverlayXOffset, _icons);
+        if (App.DebugMode) PriceOverlayManager.EnableDebug();
         Log("overlay ready");
+
+        double captureMs, detectMs, ocrMs, matchMs;
+        ScanTimings BuildTimings(double cycleMs) => new(
+            captureMs, detectMs, ocrMs, matchMs, cycleMs,
+            _prices.LastFetchDurationMs, _prices.IsFetching);
 
         while (!ct.IsCancellationRequested)
         {
             var cycleStart = sw.ElapsedMilliseconds;
             cycleCount++;
+            captureMs = detectMs = ocrMs = matchMs = 0;
             try
             {
-                using var bmp = ScreenCapture.CaptureRegion(_config.RegionRect);
+                var phase = Stopwatch.StartNew();
+                PriceOverlayManager.SuspendForCapture();
+                Bitmap? bmp = null;
+                try
+                {
+                    bmp = ScreenCapture.CaptureRegion(_config.RegionRect);
+                }
+                finally
+                {
+                    PriceOverlayManager.ResumeAfterCapture();
+                }
+                using (bmp)
+                {
+                captureMs = phase.Elapsed.TotalMilliseconds;
+                phase.Restart();
                 detector.IsOpen(bmp, out var sampledPixel);   // bool unused — we apply our own hysteresis
+                detectMs = phase.Elapsed.TotalMilliseconds;
                 int brightness = (sampledPixel.R + sampledPixel.G + sampledPixel.B) / 3;
                 bool brightFrame = brightness > OpenBrightness;   // strong enough to count toward opening
                 bool darkFrame = brightness < CloseBrightness;    // dim enough to count toward closing
@@ -136,7 +160,7 @@ internal sealed class ScanEngine : IDisposable
                     isOpen = false; confirmedOpen = false; brightStreak = 0; darkStreak = 0;
                     slots.Clear(); lastRows = [];
                     _showing = false;
-                    PriceOverlayManager.UpdateState([], false, false);
+                    PriceOverlayManager.UpdateState([], false, false, false, BuildTimings(sw.ElapsedMilliseconds - cycleStart));
                 }
                 else
                 {
@@ -170,7 +194,7 @@ internal sealed class ScanEngine : IDisposable
                         if (isOpen && !suppressHintUntilConfirm)
                         {
                             _showing = false;
-                            PriceOverlayManager.UpdateState([], false, true);
+                            PriceOverlayManager.UpdateState([], isOpen, false, true, BuildTimings(sw.ElapsedMilliseconds - cycleStart));
                         }
                     }
 
@@ -180,7 +204,9 @@ internal sealed class ScanEngine : IDisposable
                         if ((now - lastOcrAt).TotalMilliseconds >= MinOcrIntervalMs)
                         {
                             lastOcrAt = now;
+                            phase.Restart();
                             var ocrRows = scanner.Scan(bmp);
+                            ocrMs = phase.Elapsed.TotalMilliseconds;
                             if (ocrRows.Count == 0)
                             {
                                 // Panel mid-animation or a bad frame — don't disturb locked rows.
@@ -188,25 +214,35 @@ internal sealed class ScanEngine : IDisposable
                             }
                             else
                             {
+                                phase.Restart();
                                 var reads = BuildPriceRows(ocrRows);
+                                lastRows = MergeReads(slots, reads);
+                                matchMs = phase.Elapsed.TotalMilliseconds;
                                 Log($"OCR {ocrRows.Count} rows → " +
                                     string.Join(" | ", reads.Select(r =>
                                         $"raw='{r.OcrText.Trim()}' y={r.CenterY} " +
                                         $"{(r.HasPrice ? $"HIT→'{r.Name}'" : "MISS")}")));
 
-                                // Confirm a real exchange panel only when OCR resolves an actual
-                                // priced item — combat effects / stray windows never do.
-                                if (!confirmedOpen && reads.Any(r => r.HasPrice))
+                                // Confirm once OCR sees real item lines (not only brightness).
+                                if (!confirmedOpen)
                                 {
-                                    confirmedOpen = true;
-                                    suppressHintUntilConfirm = false;   // a real panel is back — re-enable the hint
-                                    Log("panel CONFIRMED (priced row found)");
+                                    int itemLines = ocrRows.Count(r => !OcrRowFilters.IsPanelChrome(r.NormalizedName));
+                                    if (reads.Any(r => r.HasPrice) ||
+                                        reads.Any(r => OcrRowFilters.LooksLikeReward(r.Name)) ||
+                                        itemLines > 0)
+                                    {
+                                        confirmedOpen = true;
+                                        suppressHintUntilConfirm = false;
+                                        Log($"panel CONFIRMED (items={itemLines} priced={reads.Count(r => r.HasPrice)})");
+                                    }
                                 }
 
                                 // Per-row slots: a row locks once confirmed, then stays fixed;
                                 // unpriced rows keep being retried every pass.
-                                lastRows = MergeReads(slots, reads);
                             }
+
+                            if (App.DebugMode)
+                                Log($"perf captura={captureMs:F1} detecção={detectMs:F1} ocr={ocrMs:F1} match={matchMs:F1} ciclo={sw.ElapsedMilliseconds - cycleStart:F1}");
                         }
                     }
                     else
@@ -218,11 +254,12 @@ internal sealed class ScanEngine : IDisposable
 
                     // "reading" = brightness says a panel is up but OCR hasn't confirmed prices yet.
                     // Suppressed straight after a dismiss until a real confirm (anti-flicker, see above).
-                    bool reading = isOpen && !confirmedOpen && !suppressHintUntilConfirm;
+                    bool reading = isOpen && !confirmedOpen && !suppressHintUntilConfirm
+                                              && !lastRows.Any(r => r.HasPrice);
 
                     // Show prices only once OCR has confirmed a real list, not on brightness alone.
                     _showing = confirmedOpen;
-                    PriceOverlayManager.UpdateState(lastRows, confirmedOpen, reading);
+                    PriceOverlayManager.UpdateState(lastRows, isOpen, confirmedOpen, reading, BuildTimings(sw.ElapsedMilliseconds - cycleStart));
 
                     topmostCounter++;
                     if (topmostCounter >= TopmostEveryN)
@@ -231,6 +268,7 @@ internal sealed class ScanEngine : IDisposable
                         topmostCounter = 0;
                     }
                 }
+                }   // using (bmp)
             }
             catch (Exception ex)
             {
@@ -259,7 +297,7 @@ internal sealed class ScanEngine : IDisposable
 
         foreach (var row in ocrRows)
         {
-            if (row.NormalizedName.Contains("runeshape"))
+            if (OcrRowFilters.IsPanelChrome(row.NormalizedName))
                 continue;
 
             int stableY = row.CenterY;
@@ -301,60 +339,14 @@ internal sealed class ScanEngine : IDisposable
                 continue;
             }
 
-            // Resolve the OCR'd name to a price key: exact → prefix → fuzzy (edit distance).
-            // The fuzzy step rescues single-character misreads ("viswn" → "vision"). The matched
-            // key (not the noisy OCR text) is stored as the row Name so the same item locks even
-            // when OCR jitters between passes.
-            PriceEntry? entry;
-            string matchedKey = row.NormalizedName;
-            bool exact = false;
-            if (snapshot.TryGetValue(row.NormalizedName, out entry))
-            {
-                exact = true;
-            }
-            else if (row.NormalizedName.Length >= 10 &&
-                     snapshot.Keys.Where(k => k.StartsWith(row.NormalizedName, StringComparison.Ordinal))
-                                  .MinBy(k => k.Length) is { } prefixKey)
-            {
-                entry = snapshot[prefixKey];
-                matchedKey = prefixKey;
-            }
-            else if (row.NormalizedName.Length >= 6 &&
-                     BestFuzzy(snapshot, row.NormalizedName) is { } fuzzy)
-            {
-                entry = snapshot[fuzzy];
-                matchedKey = fuzzy;
-            }
-
-            if (entry != null)
+            // Resolve the OCR'd name to a price key: exact → artifact fix → prefix → fuzzy → tokens.
+            if (ItemNameMatcher.TryMatch(row.NormalizedName, _prices.Catalog, out var matchedKey, out var entry, out var exact))
                 rows.Add(new PriceRow(stableY, row.RawText, entry.DivineValue, entry.ExaltedValue, true, row.Multiplier, matchedKey, exact));
             else
                 rows.Add(new PriceRow(stableY, row.RawText, 0m, 0m, false, row.Multiplier, row.NormalizedName));
         }
         _lastPositions = newPositions;
         return rows;
-    }
-
-    // Minimum character-similarity (1 - editDistance/maxLen) for a fuzzy price match.
-    // 0.84 lets ~2 wrong characters through on a 12+ char name, 1 on a ~6 char name —
-    // enough to absorb typical OCR slips without matching an unrelated item.
-    private const double FuzzyThreshold = 0.84;
-
-    // Closest price key to an OCR'd name by Levenshtein similarity, or null if nothing clears
-    // FuzzyThreshold. Only candidates within ±3 of the name's length are considered (cheaper,
-    // and a large length gap is never a near-match).
-    private static string? BestFuzzy(IReadOnlyDictionary<string, PriceEntry> snapshot, string name)
-    {
-        string? best = null;
-        double bestScore = FuzzyThreshold;   // must strictly exceed the threshold to win
-        foreach (var key in snapshot.Keys)
-        {
-            if (Math.Abs(key.Length - name.Length) > 3) continue;
-            int dist = Levenshtein(name, key);
-            double score = 1.0 - (double)dist / Math.Max(name.Length, key.Length);
-            if (score > bestScore) { bestScore = score; best = key; }
-        }
-        return best;
     }
 
     // Detect an uncut gem and pin its identity. Returns true when the name is an uncut gem (a type
@@ -483,9 +475,9 @@ internal sealed class ScanEngine : IDisposable
         var display = new List<PriceRow>(slots.Count);
         foreach (var s in slots.OrderBy(s => s.Y))
         {
-            display.Add(s.Locked
-                ? s.LockedRow
-                : s.Latest with { CenterY = s.Y, HasPrice = false, DivineValue = 0m, ExaltedValue = 0m });
+            // Show the latest match immediately — locking only pins a row across noisy frames,
+            // it must not hide a price that already matched on the first OCR pass.
+            display.Add(s.Locked ? s.LockedRow : s.Latest with { CenterY = s.Y });
         }
         return display;
     }

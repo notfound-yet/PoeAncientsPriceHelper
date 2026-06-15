@@ -118,8 +118,6 @@ public class PriceRepositoryTests
         Assert.True(repo.Prices.ContainsKey("chilling flux"));
     }
 
-    // The league name (e.g. the "HC Runes of Aldur" Hardcore variant) is used verbatim — URL-escaped —
-    // as poe.ninja's API league param, and slugged into the Referer.
     [Theory]
     [InlineData("Runes of Aldur", "league=Runes%20of%20Aldur&", "/economy/runesofaldur/")]
     [InlineData("HC Runes of Aldur", "league=HC%20Runes%20of%20Aldur&", "/economy/hcrunesofaldur/")]
@@ -146,6 +144,75 @@ public class PriceRepositoryTests
     public void NormalizeName_ProducesConsistentKey(string input, string expected)
     {
         Assert.Equal(expected, PriceRepository.NormalizeName(input));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WritesCacheFile()
+    {
+        using var http = FakeHttp(FakeApiResponse);
+        using var dir = new TempDir();
+        var config = DefaultConfig(dir.Path);
+        var repo = new PriceRepository(http);
+
+        await repo.RefreshAsync(config);
+
+        var path = PriceCacheStore.CachePathForLeague(config.LeagueName);
+        Assert.True(File.Exists(path));
+        var cache = PriceCacheStore.Load(config.LeagueName);
+        Assert.NotNull(cache);
+        Assert.True(cache!.Items.ContainsKey("chilling flux"));
+    }
+
+    [Fact]
+    public async Task TryLoadFromCache_RestoresPricesWithoutHttp()
+    {
+        using var dir = new TempDir();
+        var config = DefaultConfig(dir.Path);
+        var cacheDir = Path.Combine(AppContext.BaseDirectory, "cache");
+        Directory.CreateDirectory(cacheDir);
+        var path = PriceCacheStore.CachePathForLeague(config.LeagueName);
+        var file = new PriceCacheFile
+        {
+            League = config.LeagueName,
+            FetchedAt = DateTime.Now.AddHours(-1),
+            Items = new Dictionary<string, CachedPriceEntry>
+            {
+                ["rune of vitality"] = new() { DivineValue = 0.5m, ExaltedValue = 5m },
+            },
+        };
+        File.WriteAllText(path, Newtonsoft.Json.JsonConvert.SerializeObject(file));
+
+        try
+        {
+            using var http = new FailingHttpHandler();
+            using var client = new HttpClient(http);
+            var repo = new PriceRepository(client);
+
+            Assert.True(repo.TryLoadFromCache(config));
+            Assert.Equal(0.5m, repo.Prices["rune of vitality"].DivineValue);
+            Assert.Equal(1, repo.Catalog.Count);
+            Assert.True(repo.IsFromCache);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ExchangeItemCatalog_IndexesPrefixCandidates()
+    {
+        var dict = new Dictionary<string, PriceEntry>
+        {
+            ["rune of vitality"] = new(1m, 10m),
+            ["rune of the blossom"] = new(2m, 20m),
+            ["exalted orb"] = new(3m, 30m),
+        };
+        var catalog = new ExchangeItemCatalog(dict);
+        Assert.Equal(3, catalog.Count);
+
+        var keys = catalog.KeysWithPrefix("rune of ");
+        Assert.Equal(2, keys.Length);
     }
 
     private static HttpClient FakeHttp(string responseJson)
